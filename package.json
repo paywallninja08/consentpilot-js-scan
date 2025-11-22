@@ -1,0 +1,14 @@
+{
+  "name": "consentpilot-js-scan",
+  "version": "1.0.0",
+  "main": "server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.0",
+    "playwright": "^1.47.0",
+    "cors": "^2.8.5"
+  }
+}
