@@ -9,8 +9,80 @@ const PORT = process.env.PORT || 8080;
 app.use(express.json());
 
 app.get('/health', (req, res) => {
-  res.json({ status: 'ok', service: 'consentpilot-js-scanner', timestamp: new Date().toISOString() });
+  res.json({ status: 'ok', service: 'consentpilot-js-scanner', version: '3.0', timestamp: new Date().toISOString() });
 });
+
+// ─── FIX 1: EXHAUSTIVE GA4 MATCHERS ────────────────────────────────────────
+function isGa4Request(url) {
+  return (
+    url.includes('google-analytics.com/g/collect') ||
+    url.includes('analytics.google.com/g/collect') ||        // ← Gymshark uses THIS
+    url.includes('region1.google-analytics.com/g/collect') ||
+    url.includes('region1.analytics.google.com/g/collect') ||
+    url.includes('stats.g.doubleclick.net/g/collect') ||
+    url.includes('googletagmanager.com/gtag/js') ||           // GTM-loaded GA4
+    url.includes('googletagmanager.com/gtag/destination') ||
+    // signature fallback — tid=G- in collect calls
+    (url.includes('/g/collect') && url.includes('tid=G-'))
+  );
+}
+
+// ─── FIX 2: EXHAUSTIVE ADS MATCHERS ────────────────────────────────────────
+function isAdsRequest(url) {
+  return (
+    url.includes('googleadservices.com/pagead/conversion') ||
+    url.includes('googleadservices.com/pagead/1p-conversion') ||
+    url.includes('googleadservices.com/pagead/1p-user-list') ||
+    url.includes('googleads.g.doubleclick.net') ||
+    url.includes('cm.g.doubleclick.net') ||
+    url.includes('ad.doubleclick.net') ||
+    url.includes('stats.g.doubleclick.net/dc/')
+  );
+}
+
+function isGtmRequest(url) {
+  return (
+    url.includes('googletagmanager.com/gtm.js') ||
+    url.includes('googletagmanager.com/gtag/js') ||
+    (url.includes('GTM-') && url.includes('googletagmanager.com'))
+  );
+}
+
+// ─── FIX 5: GEO-REDIRECT DETECTION ─────────────────────────────────────────
+function detectGeoRedirect(inputUrl, finalUrl) {
+  try {
+    const input = new URL(inputUrl);
+    const final = new URL(finalUrl);
+
+    if (input.hostname === final.hostname) return { geoRedirect: false };
+
+    const checkoutSubdomains = ['checkout', 'cart', 'account', 'pay', 'billing', 'store', 'shop', 'us', 'de', 'fr', 'eu', 'au', 'ca', 'jp', 'uk'];
+    const finalSub = final.hostname.split('.')[0].toLowerCase();
+    const inputSub = input.hostname.split('.')[0].toLowerCase();
+
+    const inputTld = input.hostname.split('.').slice(-2).join('.');
+    const finalTld = final.hostname.split('.').slice(-2).join('.');
+    const tldChanged = inputTld !== finalTld;
+
+    const landedOnCheckout = checkoutSubdomains.some(s => finalSub === s || final.hostname.includes(`${s}.`));
+    const subdomainChanged = finalSub !== inputSub && finalSub !== 'www';
+
+    if (tldChanged || landedOnCheckout || subdomainChanged) {
+      return {
+        geoRedirect: true,
+        geoRedirectReason: landedOnCheckout
+          ? `Redirected to ${final.hostname} (checkout/region subdomain — results may not reflect original page)`
+          : tldChanged
+            ? `TLD changed from ${inputTld} to ${finalTld} (geo-redirect)`
+            : `Subdomain changed from ${input.hostname} to ${final.hostname}`,
+        finalUrl: finalUrl
+      };
+    }
+    return { geoRedirect: false };
+  } catch {
+    return { geoRedirect: false };
+  }
+}
 
 async function detectWafBlocking(page, response) {
   try {
@@ -39,9 +111,9 @@ async function detectWafBlocking(page, response) {
   }
 }
 
+// ─── FIX 4: REJECT-FIRST BUTTON MATCHING ───────────────────────────────────
 async function detectCmpAndButtons(page) {
   try {
-    // Check main frame first, then iframes
     const frames = page.frames();
     let cmpData = null;
 
@@ -51,7 +123,7 @@ async function detectCmpAndButtons(page) {
           const html = document.documentElement.innerHTML.toLowerCase();
 
           const vendors = {
-            'OneTrust': ['onetrust', 'ot-sdk-btn'],
+            'OneTrust': ['onetrust', 'ot-sdk-btn', 'optanon'],
             'Cookiebot': ['cookiebot', 'cookieconsent'],
             'Usercentrics': ['usercentrics', 'uc-'],
             'Didomi': ['didomi', 'didomi-consent'],
@@ -72,8 +144,27 @@ async function detectCmpAndButtons(page) {
           const hasCmpMarkers = html.includes('cookie') && (html.includes('consent') || html.includes('banner') || html.includes('accept'));
           if (!detectedVendor && hasCmpMarkers) detectedVendor = 'Custom or unknown';
 
-          const acceptPatterns = ['accept all','accept cookies','agree to all','allow all cookies','allow all','akzeptieren','alle akzeptieren','tout accepter','accepter tout','i agree','i accept'];
-          const rejectPatterns = ['reject all','decline all','only necessary','only essential','necessary only','ablehnen','alle ablehnen','refuser tout','continue without accepting','manage preferences'];
+          // REJECT patterns checked FIRST — order is critical
+          // Includes "accept only essential" style buttons which are REJECT actions
+          const rejectPatterns = [
+            'reject all', 'reject cookies', 'decline all', 'decline cookies',
+            'only necessary', 'only essential', 'necessary only', 'essential only',
+            'accept only essential', 'accept only necessary',      // ← Gymshark
+            'accept essential only', 'accept necessary only',
+            'necessary cookies only', 'essential cookies only',
+            'continue without accepting', 'continue without agreeing',
+            'refuse all', 'refuse cookies',
+            'ablehnen', 'alle ablehnen', 'nur notwendige',
+            'refuser tout', 'continuer sans accepter',
+            'manage preferences', 'cookie settings'
+          ];
+
+          const acceptPatterns = [
+            'accept all cookies', 'accept all', 'allow all cookies', 'allow all',
+            'agree to all', 'i agree', 'i accept', 'accept cookies',
+            'akzeptieren', 'alle akzeptieren',
+            'tout accepter', 'accepter tout'
+          ];
 
           const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"], input[type="submit"]'));
 
@@ -83,15 +174,31 @@ async function detectCmpAndButtons(page) {
           for (const btn of buttons) {
             const text = (btn.innerText || btn.textContent || btn.value || '').toLowerCase().trim();
             const ariaLabel = (btn.getAttribute('aria-label') || '').toLowerCase();
-            const fullText = `${text} ${ariaLabel}`.trim();
+            const id = (btn.id || '').toLowerCase();
+            const fullText = `${text} ${ariaLabel} ${id}`.trim();
             if (!fullText) continue;
 
-            if (!acceptButton && acceptPatterns.some(p => fullText.includes(p))) {
-              acceptButton = { text: text.substring(0, 80) };
-            }
+            // Check REJECT first
             if (!rejectButton && rejectPatterns.some(p => fullText.includes(p))) {
               rejectButton = { text: text.substring(0, 80) };
             }
+            // Then check accept — but only if it doesn't match a reject pattern
+            if (!acceptButton && acceptPatterns.some(p => fullText.includes(p))) {
+              const isActuallyReject = rejectPatterns.some(p => fullText.includes(p));
+              if (!isActuallyReject) {
+                acceptButton = { text: text.substring(0, 80) };
+              }
+            }
+          }
+
+          // Also try OneTrust specific IDs as fallback
+          if (!acceptButton) {
+            const otAccept = document.querySelector('#onetrust-accept-btn-handler');
+            if (otAccept) acceptButton = { text: (otAccept.innerText || 'Accept All Cookies').substring(0, 80) };
+          }
+          if (!rejectButton) {
+            const otReject = document.querySelector('#onetrust-reject-all-handler');
+            if (otReject) rejectButton = { text: (otReject.innerText || 'Reject All').substring(0, 80) };
           }
 
           return {
@@ -101,21 +208,16 @@ async function detectCmpAndButtons(page) {
             hasRejectAll: !!rejectButton,
             acceptButtonText: acceptButton?.text || null,
             rejectButtonText: rejectButton?.text || null,
-            foundInFrame: true
           };
         });
 
-        // Use first frame that finds a vendor or buttons
         if (result.detected || result.hasAcceptAll || result.hasRejectAll) {
           cmpData = result;
           break;
         }
-
-        // Keep as fallback if main frame
         if (!cmpData) cmpData = result;
 
       } catch (frameErr) {
-        // iframe may be cross-origin, skip it
         continue;
       }
     }
@@ -133,6 +235,28 @@ async function detectCmpAndButtons(page) {
 }
 
 async function clickButtonInAllFrames(page, targetText) {
+  // First try OneTrust IDs directly — most reliable
+  const otClicked = await page.evaluate((text) => {
+    // Map text hint to known OneTrust button IDs
+    const rejectKeywords = ['essential', 'necessary', 'reject', 'decline', 'refuse', 'without'];
+    const isReject = rejectKeywords.some(k => text.includes(k));
+
+    if (isReject) {
+      const btn = document.querySelector('#onetrust-reject-all-handler') ||
+                  document.querySelector('.ot-pc-refuse-all-handler') ||
+                  document.querySelector('[class*="reject"]');
+      if (btn) { btn.click(); return true; }
+    } else {
+      const btn = document.querySelector('#onetrust-accept-btn-handler') ||
+                  document.querySelector('.accept-cookies-button');
+      if (btn) { btn.click(); return true; }
+    }
+    return false;
+  }, targetText);
+
+  if (otClicked) return true;
+
+  // Fallback: text matching across all frames
   const frames = page.frames();
   for (const frame of frames) {
     try {
@@ -153,6 +277,7 @@ async function clickButtonInAllFrames(page, targetText) {
   return false;
 }
 
+// ─── FIX 8: ENHANCED CONSENT MODE DETECTION ────────────────────────────────
 async function detectConsentModeState(page) {
   try {
     const consentState = await page.evaluate(() => {
@@ -169,9 +294,32 @@ async function detectConsentModeState(page) {
           if (c.ad_user_data) { ad_user_data = c.ad_user_data; signalsDetected.push('ad_user_data'); }
           if (c.ad_personalization) { ad_personalization = c.ad_personalization; signalsDetected.push('ad_personalization'); }
         }
-        if (item.ad_storage) ad_storage = item.ad_storage;
-        if (item.analytics_storage) analytics_storage = item.analytics_storage;
+        if (item.ad_storage && !ad_storage) ad_storage = item.ad_storage;
+        if (item.analytics_storage && !analytics_storage) analytics_storage = item.analytics_storage;
       }
+
+      // Check window.google_tag_data (GTM internal consent store)
+      try {
+        const gtd = window.google_tag_data;
+        if (gtd && gtd.ics && gtd.ics.entries) {
+          const entries = gtd.ics.entries;
+          if (entries.ad_storage && !ad_storage) { ad_storage = entries.ad_storage.update || null; signalsDetected.push('ad_storage'); }
+          if (entries.analytics_storage && !analytics_storage) { analytics_storage = entries.analytics_storage.update || null; signalsDetected.push('analytics_storage'); }
+        }
+      } catch (_) {}
+
+      // Check gtag queue
+      try {
+        if (typeof window.gtag === 'function' && window.gtag.q) {
+          for (const call of window.gtag.q || []) {
+            if (call[0] === 'consent' && call[2]) {
+              const c = call[2];
+              if (c.ad_storage && !ad_storage) { ad_storage = c.ad_storage; signalsDetected.push('ad_storage'); }
+              if (c.analytics_storage && !analytics_storage) { analytics_storage = c.analytics_storage; signalsDetected.push('analytics_storage'); }
+            }
+          }
+        }
+      } catch (_) {}
 
       const scripts = Array.from(document.querySelectorAll('script'));
       const scriptContent = scripts.map(s => s.textContent || '').join(' ');
@@ -180,11 +328,18 @@ async function detectConsentModeState(page) {
         if (scriptContent.includes('analytics_storage') && !signalsDetected.includes('analytics_storage')) { signalsDetected.push('analytics_storage'); analytics_storage = analytics_storage || 'unknown'; }
       }
 
-      return { ad_storage, analytics_storage, ad_user_data, ad_personalization, signalsDetected: [...new Set(signalsDetected)] };
+      return {
+        ad_storage, analytics_storage, ad_user_data, ad_personalization,
+        signalsDetected: [...new Set(signalsDetected)],
+        tcfPresent: typeof window.__tcfapi === 'function',
+        uspPresent: typeof window.__uspapi === 'function',
+        hasGtag: typeof window.gtag === 'function',
+        hasDataLayer: Array.isArray(window.dataLayer)
+      };
     });
     return consentState;
   } catch (e) {
-    return { ad_storage: null, analytics_storage: null, ad_user_data: null, ad_personalization: null, signalsDetected: [] };
+    return { ad_storage: null, analytics_storage: null, ad_user_data: null, ad_personalization: null, signalsDetected: [], tcfPresent: false, uspPresent: false };
   }
 }
 
@@ -197,6 +352,91 @@ async function captureDataLayerEvents(page) {
       }).filter(Boolean);
     });
   } catch (e) { return []; }
+}
+
+// ─── FIX 3: PRE-CONSENT FLOW ────────────────────────────────────────────────
+async function runPreConsentFlow(browser, url, maxWaitMs) {
+  const startTime = Date.now();
+  let context = null, page = null;
+
+  try {
+    context = await browser.createIncognitoBrowserContext();
+    page = await context.newPage();
+
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1366, height: 768 });
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB,en;q=0.9' });
+
+    const preConsentHits = { ga4: [], ads: [], gtm: [] };
+
+    // Capture ALL network hits from page load — before any interaction
+    page.on('request', request => {
+      const u = request.url();
+      if (isGa4Request(u)) preConsentHits.ga4.push(u.substring(0, 150));
+      else if (isAdsRequest(u)) preConsentHits.ads.push(u.substring(0, 150));
+      else if (isGtmRequest(u)) preConsentHits.gtm.push(u.substring(0, 150));
+    });
+
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 15000 });
+    const finalUrl = page.url();
+    const httpStatus = response?.status() || null;
+
+    // Wait for CMP to appear — poll up to 4s
+    let bannerDetected = false;
+    for (let i = 0; i < 8; i++) {
+      await page.waitForTimeout(500);
+      const hasBanner = await page.evaluate(() => {
+        return !!(
+          document.querySelector('#onetrust-banner-sdk') ||
+          document.querySelector('#onetrust-consent-sdk') ||
+          document.querySelector('[class*="cookie-banner"]') ||
+          document.querySelector('[class*="consent-banner"]') ||
+          document.querySelector('[id*="cookie-consent"]') ||
+          (document.body && document.body.innerHTML.toLowerCase().includes('accept all cookies'))
+        );
+      }).catch(() => false);
+      if (hasBanner) { bannerDetected = true; break; }
+    }
+
+    // Record hits captured BEFORE any banner interaction
+    const preConsentGa4Count = preConsentHits.ga4.length;
+    const preConsentAdsCount = preConsentHits.ads.length;
+    const preConsentGtmCount = preConsentHits.gtm.length;
+
+    // Geo-redirect detection
+    const geoInfo = detectGeoRedirect(url, finalUrl);
+
+    return {
+      flowName: 'preConsent',
+      success: true,
+      duration: Date.now() - startTime,
+      finalUrl,
+      httpStatus,
+      bannerDetected,
+      preConsentGa4Count,
+      preConsentAdsCount,
+      preConsentGtmCount,
+      preConsentGa4Urls: preConsentHits.ga4.slice(0, 10),
+      preConsentAdsUrls: preConsentHits.ads.slice(0, 10),
+      ...geoInfo,
+      timestamp: new Date().toISOString()
+    };
+
+  } catch (error) {
+    return {
+      flowName: 'preConsent',
+      success: false,
+      duration: Date.now() - startTime,
+      preConsentGa4Count: 0,
+      preConsentAdsCount: 0,
+      preConsentGtmCount: 0,
+      error: error.message,
+      timestamp: new Date().toISOString()
+    };
+  } finally {
+    if (page) await page.close().catch(() => {});
+    if (context) await context.close().catch(() => {});
+  }
 }
 
 async function runFlow(browser, url, flowName, maxWaitMs) {
@@ -213,13 +453,14 @@ async function runFlow(browser, url, flowName, maxWaitMs) {
 
     const networkSummary = { ga4Requests: [], adsRequests: [], gtmRequests: [], otherTracking: [] };
 
+    // FIX 1+2: Use exhaustive matchers
     page.on('request', request => {
       const u = request.url();
-      if (u.includes('google-analytics.com/g/collect') || u.includes('googletagmanager.com/gtag/js?id=G-') || u.includes('region1.google-analytics.com/g/collect')) {
+      if (isGa4Request(u)) {
         networkSummary.ga4Requests.push({ url: u.substring(0, 150), method: request.method() });
-      } else if (u.includes('googleadservices.com/pagead/conversion') || u.includes('googleads.g.doubleclick.net')) {
+      } else if (isAdsRequest(u)) {
         networkSummary.adsRequests.push({ url: u.substring(0, 150), method: request.method() });
-      } else if (u.includes('googletagmanager.com/gtm.js') || u.includes('GTM-')) {
+      } else if (isGtmRequest(u)) {
         networkSummary.gtmRequests.push({ url: u.substring(0, 150), method: request.method() });
       }
     });
@@ -230,11 +471,11 @@ async function runFlow(browser, url, flowName, maxWaitMs) {
 
     const wafStatus = await detectWafBlocking(page, response);
     if (wafStatus.blocked) {
-      return { flowName, success: false, duration: Date.now() - startTime, finalUrl, httpStatus, wafBlocked: true, wafReason: wafStatus.reason, error: 'Site blocked by WAF or captcha', timestamp: new Date().toISOString() };
+      return { flowName, success: false, duration: Date.now() - startTime, finalUrl, httpStatus, wafBlocked: true, wafReason: wafStatus.reason, error: 'WAF blocked', timestamp: new Date().toISOString() };
     }
 
-    // Wait for CMP to load
-    await page.waitForTimeout(2500);
+    // Wait longer for CMP — OneTrust often injects 3-4s after load
+    await page.waitForTimeout(3500);
 
     const cmpData = await detectCmpAndButtons(page);
     const consentModeBefore = await detectConsentModeState(page);
@@ -254,7 +495,7 @@ async function runFlow(browser, url, flowName, maxWaitMs) {
     } else if (flowName === 'baseline') {
       actionTaken = 'No interaction (baseline flow)';
     } else {
-      actionTaken = `Button not found for ${flowName}`;
+      actionTaken = `Button not found for ${flowName} — cmp.hasRejectAll=${cmpData.hasRejectAll} rejectText=${cmpData.rejectButtonText}`;
     }
 
     const consentModeAfter = await detectConsentModeState(page);
@@ -289,8 +530,76 @@ async function runFlow(browser, url, flowName, maxWaitMs) {
   }
 }
 
+// ─── DEBUG ENDPOINT ─────────────────────────────────────────────────────────
+async function runDebugScan(url) {
+  let browser = null;
+  try {
+    browser = await puppeteer.launch({
+      headless: 'new',
+      args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-blink-features=AutomationControlled']
+    });
+    const page = await browser.newPage();
+    await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36');
+    await page.setViewport({ width: 1366, height: 900 });
+    await page.setExtraHTTPHeaders({ 'Accept-Language': 'en-GB,en;q=0.9' });
+
+    await page.goto(url, { waitUntil: 'networkidle2', timeout: 20000 }).catch(() => {});
+    await page.waitForTimeout(4000);
+
+    const report = await page.evaluate(() => {
+      const buttons = Array.from(document.querySelectorAll('button, a, [role="button"], input[type="button"]')).map(b => ({
+        tag: b.tagName.toLowerCase(),
+        id: b.id || '',
+        text: (b.innerText || b.textContent || '').replace(/\s+/g, ' ').trim().substring(0, 120),
+        ariaLabel: b.getAttribute('aria-label') || ''
+      }));
+
+      return {
+        title: document.title,
+        url: location.href,
+        buttons,
+        oneTrustLandmarks: {
+          sdk: !!document.querySelector('#onetrust-consent-sdk'),
+          bannerSdk: !!document.querySelector('#onetrust-banner-sdk'),
+          acceptBtn: !!document.querySelector('#onetrust-accept-btn-handler'),
+          rejectBtn: !!document.querySelector('#onetrust-reject-all-handler'),
+        },
+        globals: {
+          hasOneTrust: typeof window.OneTrust !== 'undefined',
+          hasOptanonWrapper: typeof window.OptanonWrapper !== 'undefined',
+          hasTcfApi: typeof window.__tcfapi === 'function',
+          hasGtag: typeof window.gtag === 'function',
+          hasDataLayer: Array.isArray(window.dataLayer),
+          dataLayerLength: Array.isArray(window.dataLayer) ? window.dataLayer.length : 0
+        }
+      };
+    });
+
+    return { status: 'ok', ...report };
+  } catch (e) {
+    return { status: 'error', errorMessage: e.message };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
+app.get('/debug-scan', async (req, res) => {
+  const url = req.query.url;
+  if (!url) return res.status(400).json({ status: 'error', errorMessage: 'Missing url' });
+  const result = await runDebugScan(url);
+  res.json(result);
+});
+
+app.post('/debug-scan', async (req, res) => {
+  const url = req.body.url;
+  if (!url) return res.status(400).json({ status: 'error', errorMessage: 'Missing url' });
+  const result = await runDebugScan(url);
+  res.json(result);
+});
+
+// ─── MAIN SCAN ORCHESTRATOR ─────────────────────────────────────────────────
 async function runJsScanV2({ url, maxWaitMs = 15000 }) {
-  const TOTAL_SCAN_TIMEOUT = 90000;
+  const TOTAL_SCAN_TIMEOUT = 100000;
   const scanStartTime = Date.now();
   let browser = null;
 
@@ -302,6 +611,15 @@ async function runJsScanV2({ url, maxWaitMs = 15000 }) {
       args: ['--no-sandbox','--disable-setuid-sandbox','--disable-dev-shm-usage','--disable-gpu','--disable-blink-features=AutomationControlled','--window-size=1366,768']
     });
 
+    // FIX 3: Pre-consent flow runs first — captures tracking before banner interaction
+    console.log('[JS-SCAN] Running preConsent flow...');
+    const preConsent = await runPreConsentFlow(browser, url, maxWaitMs);
+    console.log(`[JS-SCAN] preConsent: GA4=${preConsent.preConsentGa4Count} Ads=${preConsent.preConsentAdsCount} bannerDetected=${preConsent.bannerDetected}`);
+
+    if (Date.now() - scanStartTime > TOTAL_SCAN_TIMEOUT - 30000) {
+      return buildPartialResult(url, preConsent, null, null, null);
+    }
+
     console.log('[JS-SCAN] Running baseline flow...');
     const baseline = await runFlow(browser, url, 'baseline', maxWaitMs);
 
@@ -310,37 +628,56 @@ async function runJsScanV2({ url, maxWaitMs = 15000 }) {
     }
 
     if (Date.now() - scanStartTime > TOTAL_SCAN_TIMEOUT - 25000) {
-      return { url, status: 'partial', errorMessage: 'Scan timeout after baseline', meta: { timestamp: new Date().toISOString() }, cmp: baseline.cmp, tracking: { flows: { baseline: { tracking: baseline.tracking, dataLayerEvents: baseline.dataLayerEvents, actionTaken: baseline.actionTaken } } } };
+      return buildPartialResult(url, preConsent, baseline, null, null);
     }
 
     console.log('[JS-SCAN] Running acceptAll flow...');
     const acceptAll = await runFlow(browser, url, 'acceptAll', maxWaitMs);
 
     if (Date.now() - scanStartTime > TOTAL_SCAN_TIMEOUT - 25000) {
-      return { url, status: 'partial', errorMessage: 'Scan timeout after acceptAll', meta: { timestamp: new Date().toISOString() }, cmp: baseline.cmp || acceptAll.cmp, tracking: { flows: { baseline: { tracking: baseline.tracking, actionTaken: baseline.actionTaken }, acceptAll: { tracking: acceptAll.tracking, actionTaken: acceptAll.actionTaken } } } };
+      return buildPartialResult(url, preConsent, baseline, acceptAll, null);
     }
 
     console.log('[JS-SCAN] Running rejectAll flow...');
     const rejectAll = await runFlow(browser, url, 'rejectAll', maxWaitMs);
 
     const cmp = baseline.cmp || acceptAll.cmp || rejectAll.cmp;
-    const allSignals = [...(baseline.consentMode?.before?.signalsDetected || []), ...(acceptAll.consentMode?.before?.signalsDetected || []), ...(rejectAll.consentMode?.before?.signalsDetected || [])];
-    const uniqueSignals = [...new Set(allSignals)];
+    const allSignals = [
+      ...(baseline.consentMode?.before?.signalsDetected || []),
+      ...(acceptAll.consentMode?.before?.signalsDetected || []),
+      ...(rejectAll.consentMode?.before?.signalsDetected || [])
+    ];
 
     const totalDuration = Date.now() - scanStartTime;
     console.log(`[JS-SCAN] Completed in ${totalDuration}ms`);
 
     return {
       url, status: 'ok', errorMessage: null,
-      meta: { finalUrl: baseline.finalUrl || url, httpStatus: baseline.httpStatus, timestamp: new Date().toISOString(), totalDuration },
+      meta: {
+        finalUrl: preConsent.finalUrl || baseline.finalUrl || url,
+        httpStatus: baseline.httpStatus,
+        timestamp: new Date().toISOString(),
+        totalDuration
+      },
       waf: { blocked: false, reason: null },
+      // FIX 3: Pre-consent counts surfaced top-level for risk engine
+      preConsentGa4Count: preConsent.preConsentGa4Count || 0,
+      preConsentAdsCount: preConsent.preConsentAdsCount || 0,
+      preConsentGtmCount: preConsent.preConsentGtmCount || 0,
+      preConsentGa4Urls: preConsent.preConsentGa4Urls || [],
+      bannerDetected: preConsent.bannerDetected || false,
+      // FIX 5: Geo-redirect surfaced top-level
+      geoRedirect: preConsent.geoRedirect || false,
+      geoRedirectReason: preConsent.geoRedirectReason || null,
       cmp,
       consentMode: {
-        implemented: uniqueSignals.length > 0,
-        signalsDetected: uniqueSignals,
+        implemented: allSignals.length > 0,
+        signalsDetected: [...new Set(allSignals)],
         defaultState: baseline.consentMode?.before || null,
         acceptAllState: acceptAll.consentMode?.after || null,
-        rejectAllState: rejectAll.consentMode?.after || null
+        rejectAllState: rejectAll.consentMode?.after || null,
+        tcfPresent: baseline.consentMode?.before?.tcfPresent || false,
+        uspPresent: baseline.consentMode?.before?.uspPresent || false
       },
       tracking: {
         flows: {
@@ -353,11 +690,30 @@ async function runJsScanV2({ url, maxWaitMs = 15000 }) {
 
   } catch (error) {
     console.error('[JS-SCAN] Fatal error:', error);
-    const isTimeout = error.message?.includes('timeout');
-    return { url, status: 'error', errorMessage: isTimeout ? 'Navigation timeout' : (error.message || 'Unknown error'), meta: { timestamp: new Date().toISOString() }, waf: { blocked: false, reason: null } };
+    return { url, status: 'error', errorMessage: error.message || 'Unknown error', meta: { timestamp: new Date().toISOString() }, waf: { blocked: false, reason: null } };
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
+}
+
+function buildPartialResult(url, preConsent, baseline, acceptAll, rejectAll) {
+  return {
+    url, status: 'partial', errorMessage: 'Scan timeout — partial results',
+    meta: { timestamp: new Date().toISOString() },
+    preConsentGa4Count: preConsent?.preConsentGa4Count || 0,
+    preConsentAdsCount: preConsent?.preConsentAdsCount || 0,
+    preConsentGtmCount: preConsent?.preConsentGtmCount || 0,
+    geoRedirect: preConsent?.geoRedirect || false,
+    geoRedirectReason: preConsent?.geoRedirectReason || null,
+    cmp: baseline?.cmp || acceptAll?.cmp || null,
+    tracking: {
+      flows: {
+        ...(baseline ? { baseline: { tracking: baseline.tracking, actionTaken: baseline.actionTaken } } : {}),
+        ...(acceptAll ? { acceptAll: { tracking: acceptAll.tracking, actionTaken: acceptAll.actionTaken } } : {}),
+        ...(rejectAll ? { rejectAll: { tracking: rejectAll.tracking, actionTaken: rejectAll.actionTaken } } : {})
+      }
+    }
+  };
 }
 
 app.post('/api/js-scan', async (req, res) => {
@@ -366,7 +722,7 @@ app.post('/api/js-scan', async (req, res) => {
     if (!url) return res.status(400).json({ status: 'error', errorMessage: 'Missing url' });
     try { new URL(url); } catch { return res.status(400).json({ status: 'error', errorMessage: 'Invalid URL format' }); }
     const result = await runJsScanV2({ url, maxWaitMs });
-    res.status(result.status === 'ok' ? 200 : 500).json(result);
+    res.status(result.status === 'ok' || result.status === 'partial' ? 200 : 500).json(result);
   } catch (error) {
     res.status(500).json({ status: 'error', errorMessage: error.message });
   }
@@ -375,5 +731,5 @@ app.post('/api/js-scan', async (req, res) => {
 app.use((req, res) => res.status(404).json({ status: 'error', errorMessage: 'Endpoint not found' }));
 
 app.listen(PORT, () => {
-  console.log(`JS scan service listening on port ${PORT}`);
+  console.log(`JS scan service v3.0 listening on port ${PORT}`);
 });
