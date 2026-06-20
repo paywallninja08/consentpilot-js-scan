@@ -84,6 +84,29 @@ function detectGeoRedirect(inputUrl, finalUrl) {
   }
 }
 
+// ─── WAIT FOR CMP BANNER TO RENDER ─────────────────────────────────────────
+async function waitForCmpBanner(page, timeoutMs = 5000) {
+  const selectors = [
+    '#onetrust-banner-sdk',
+    '#onetrust-consent-sdk',
+    '#CybotCookiebotDialog',
+    '#usercentrics-root',
+    '#didomi-host',
+    '.ot-sdk-container',
+    '[id^="sp_message_container"]',
+  ];
+  try {
+    await page.waitForFunction(
+      (sels) => sels.some((s) => document.querySelector(s)),
+      { timeout: timeoutMs },
+      selectors,
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function detectWafBlocking(page, response) {
   try {
     const httpStatus = response?.status() || 200;
@@ -234,27 +257,39 @@ async function detectCmpAndButtons(page) {
   }
 }
 
-async function clickButtonInAllFrames(page, targetText) {
-  // First try OneTrust IDs directly — most reliable
-  const otClicked = await page.evaluate((text) => {
-    // Map text hint to known OneTrust button IDs
-    const rejectKeywords = ['essential', 'necessary', 'reject', 'decline', 'refuse', 'without'];
-    const isReject = rejectKeywords.some(k => text.includes(k));
+async function clickButtonInAllFrames(page, action /* 'accept' | 'reject' | text string */) {
+  // Determine intent from action string
+  const rejectKeywords = ['essential', 'necessary', 'reject', 'decline', 'refuse', 'without'];
+  const isReject = rejectKeywords.some(k => action.includes(k));
 
-    if (isReject) {
-      const btn = document.querySelector('#onetrust-reject-all-handler') ||
-                  document.querySelector('.ot-pc-refuse-all-handler') ||
-                  document.querySelector('[class*="reject"]');
-      if (btn) { btn.click(); return true; }
-    } else {
-      const btn = document.querySelector('#onetrust-accept-btn-handler') ||
-                  document.querySelector('.accept-cookies-button');
-      if (btn) { btn.click(); return true; }
+  // Direct-by-ID for known CMPs — most reliable, locale-independent
+  const directIds = isReject
+    ? [
+        '#onetrust-reject-all-handler',
+        '#CybotCookiebotDialogBodyLevelButtonLevelOptinDeclineAll',
+        '#didomi-notice-disagree-button',
+        '.ot-pc-refuse-all-handler',
+      ]
+    : [
+        '#onetrust-accept-btn-handler',
+        '#CybotCookiebotDialogBodyLevelButtonLevelOptinAllowAll',
+        '#didomi-notice-agree-button',
+        '.ot-pc-accept-all-handler',
+      ];
+
+  for (const sel of directIds) {
+    try {
+      const el = await page.$(sel);
+      if (el) {
+        await el.evaluate((node) => node.scrollIntoView({ block: 'center' }));
+        await el.click({ delay: 50 });
+        console.log(`[JS-SCAN] Clicked ${isReject ? 'reject' : 'accept'} via direct ID: ${sel}`);
+        return true;
+      }
+    } catch (err) {
+      console.log(`[JS-SCAN] Direct-ID click failed for ${sel}: ${err.message}`);
     }
-    return false;
-  }, targetText);
-
-  if (otClicked) return true;
+  }
 
   // Fallback: text matching across all frames
   const frames = page.frames();
@@ -268,7 +303,7 @@ async function clickButtonInAllFrames(page, targetText) {
         });
         if (btn) { btn.click(); return true; }
         return false;
-      }, targetText);
+      }, action);
       if (clicked) return true;
     } catch (frameErr) {
       continue;
@@ -474,28 +509,36 @@ async function runFlow(browser, url, flowName, maxWaitMs) {
       return { flowName, success: false, duration: Date.now() - startTime, finalUrl, httpStatus, wafBlocked: true, wafReason: wafStatus.reason, error: 'WAF blocked', timestamp: new Date().toISOString() };
     }
 
-    // Wait longer for CMP — OneTrust often injects 3-4s after load
-    await page.waitForTimeout(3500);
+    // Wait for CMP banner to render — OneTrust injects 3-5s after domcontentloaded
+    if (flowName === 'acceptAll' || flowName === 'rejectAll') {
+      const bannerReady = await waitForCmpBanner(page, 6000);
+      console.log(`[JS-SCAN] [${flowName}] CMP banner ready: ${bannerReady}`);
+      if (!bannerReady) await page.waitForTimeout(3500); // fallback wait
+    } else {
+      await page.waitForTimeout(3500);
+    }
 
     const cmpData = await detectCmpAndButtons(page);
     const consentModeBefore = await detectConsentModeState(page);
 
     let actionTaken = null;
 
-    if (flowName === 'acceptAll' && cmpData.hasAcceptAll && cmpData.acceptButtonText) {
-      const clicked = await clickButtonInAllFrames(page, cmpData.acceptButtonText.toLowerCase());
-      actionTaken = clicked ? `Clicked accept: ${cmpData.acceptButtonText}` : `Accept button not found: ${cmpData.acceptButtonText}`;
+    if (flowName === 'acceptAll') {
+      // Pass 'accept' intent — clickButtonInAllFrames tries IDs first
+      const clicked = await clickButtonInAllFrames(page, cmpData.acceptButtonText?.toLowerCase() || 'accept');
+      actionTaken = clicked ? `Clicked accept: ${cmpData.acceptButtonText || 'via ID'}` : `Accept button not found`;
       await page.waitForTimeout(2500);
       await page.waitForNetworkIdle({ timeout: 4000 }).catch(() => {});
-    } else if (flowName === 'rejectAll' && cmpData.hasRejectAll && cmpData.rejectButtonText) {
-      const clicked = await clickButtonInAllFrames(page, cmpData.rejectButtonText.toLowerCase());
-      actionTaken = clicked ? `Clicked reject: ${cmpData.rejectButtonText}` : `Reject button not found: ${cmpData.rejectButtonText}`;
+    } else if (flowName === 'rejectAll') {
+      // Pass 'reject' intent — clickButtonInAllFrames tries IDs first
+      const clicked = await clickButtonInAllFrames(page, cmpData.rejectButtonText?.toLowerCase() || 'reject essential');
+      actionTaken = clicked ? `Clicked reject: ${cmpData.rejectButtonText || 'via ID'}` : `Reject button not found`;
       await page.waitForTimeout(2500);
       await page.waitForNetworkIdle({ timeout: 4000 }).catch(() => {});
     } else if (flowName === 'baseline') {
       actionTaken = 'No interaction (baseline flow)';
     } else {
-      actionTaken = `Button not found for ${flowName} — cmp.hasRejectAll=${cmpData.hasRejectAll} rejectText=${cmpData.rejectButtonText}`;
+      actionTaken = `Unknown flow: ${flowName}`;
     }
 
     const consentModeAfter = await detectConsentModeState(page);
