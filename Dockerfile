@@ -24,9 +24,8 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 WORKDIR /app
 
 COPY package.json ./
-RUN npm install --production
+RUN npm install --production && ls -la node_modules | head -20
 COPY server.js ./
-
 EXPOSE 8080
 
 CMD ["node", "server.js"]
