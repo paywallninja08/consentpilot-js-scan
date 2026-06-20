@@ -23,9 +23,10 @@ ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium
 
 WORKDIR /app
 
-COPY package.json ./
-RUN npm install --production
+RUN npm install express puppeteer-extra puppeteer-extra-plugin-stealth puppeteer@21.6.0
+
 COPY server.js ./
+
 EXPOSE 8080
 
 CMD ["node", "server.js"]
