@@ -438,6 +438,16 @@ async function runPreConsentFlow(browser, url, maxWaitMs) {
     const preConsentAdsCount = preConsentHits.ads.length;
     const preConsentGtmCount = preConsentHits.gtm.length;
 
+    // Capture banner screenshot while banner still visible — no interaction yet
+    let bannerScreenshot = null;
+    try {
+      const buf = await page.screenshot({ encoding: 'base64', fullPage: false });
+      bannerScreenshot = `data:image/png;base64,${buf}`;
+      console.log('[JS-SCAN] Banner screenshot captured');
+    } catch (e) {
+      console.log('[JS-SCAN] Screenshot failed:', e.message);
+    }
+
     // Geo-redirect detection
     const geoInfo = detectGeoRedirect(url, finalUrl);
 
@@ -453,10 +463,11 @@ async function runPreConsentFlow(browser, url, maxWaitMs) {
       preConsentGtmCount,
       preConsentGa4Urls: preConsentHits.ga4.slice(0, 10),
       preConsentAdsUrls: preConsentHits.ads.slice(0, 10),
+      bannerScreenshot,
       ...geoInfo,
       timestamp: new Date().toISOString()
     };
-
+    
   } catch (error) {
     return {
       flowName: 'preConsent',
@@ -709,6 +720,7 @@ async function runJsScanV2({ url, maxWaitMs = 15000 }) {
       preConsentGtmCount: preConsent.preConsentGtmCount || 0,
       preConsentGa4Urls: preConsent.preConsentGa4Urls || [],
       bannerDetected: preConsent.bannerDetected || false,
+      bannerScreenshot: preConsent.bannerScreenshot || null,
       // FIX 5: Geo-redirect surfaced top-level
       geoRedirect: preConsent.geoRedirect || false,
       geoRedirectReason: preConsent.geoRedirectReason || null,
